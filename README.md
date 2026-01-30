@@ -68,7 +68,7 @@ A demonstration of how to implement **authentication** (OAuth2/OIDC and API keys
 
 ## Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - Docker and Docker Compose
 - (Optional) An MCP client for testing
 
