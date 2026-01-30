@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/redis/go-redis/v9"
 )
@@ -104,23 +107,97 @@ type ClientConfig struct {
 	RateLimit int // requests per minute
 }
 
+// contextKey is used for storing values in context.
+type contextKey string
+
+const authHeaderKey contextKey = "authHeader"
+
+// OAuth2Validator handles JWT validation using OIDC discovery.
+type OAuth2Validator struct {
+	provider *oidc.Provider
+	verifier *oidc.IDTokenVerifier
+	clientID string
+}
+
+// TokenClaims represents the claims extracted from a JWT token.
+type TokenClaims struct {
+	Subject string `json:"sub"`
+	Email   string `json:"email"`
+	Tier    string `json:"tier"` // Custom claim for rate limiting tier
+}
+
+// NewOAuth2Validator creates a new OAuth2Validator using OIDC discovery.
+func NewOAuth2Validator(ctx context.Context, issuerURL, clientID string) (*OAuth2Validator, error) {
+	provider, err := oidc.NewProvider(ctx, issuerURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OIDC provider: %w", err)
+	}
+
+	verifier := provider.Verifier(&oidc.Config{
+		ClientID: clientID,
+	})
+
+	return &OAuth2Validator{
+		provider: provider,
+		verifier: verifier,
+		clientID: clientID,
+	}, nil
+}
+
+// Validate verifies a JWT token and extracts claims.
+// Returns ClientConfig, rate limit key (oauth2:<subject>), and error.
+func (v *OAuth2Validator) Validate(ctx context.Context, rawToken string) (*ClientConfig, string, error) {
+	idToken, err := v.verifier.Verify(ctx, rawToken)
+	if err != nil {
+		return nil, "", fmt.Errorf("token verification failed: %w", err)
+	}
+
+	var claims TokenClaims
+	if err := idToken.Claims(&claims); err != nil {
+		return nil, "", fmt.Errorf("failed to parse claims: %w", err)
+	}
+
+	// Default to "free" tier if not specified
+	tier := claims.Tier
+	if tier == "" {
+		tier = "free"
+	}
+
+	clientName := claims.Email
+	if clientName == "" {
+		clientName = claims.Subject
+	}
+
+	config := &ClientConfig{
+		Name: clientName,
+		Tier: tier,
+	}
+
+	rateLimitKey := fmt.Sprintf("oauth2:%s", claims.Subject)
+
+	return config, rateLimitKey, nil
+}
+
 type RateLimitTier struct {
 	RequestsPerMinute int
 	WindowSeconds     int
 }
 
-// AuthManager handles API key authentication and distributed rate limiting.
+// AuthManager handles API key and OAuth2 authentication with distributed rate limiting.
 type AuthManager struct {
-	mu          sync.RWMutex
-	apiKeys     map[string]*ClientConfig
-	rateLimiter *RedisRateLimiter
-	tiers       map[string]RateLimitTier
+	mu              sync.RWMutex
+	apiKeys         map[string]*ClientConfig
+	rateLimiter     *RedisRateLimiter
+	tiers           map[string]RateLimitTier
+	oauth2Validator *OAuth2Validator
+	oauth2Enabled   bool
 }
 
 func NewAuthManager(redisClient *redis.Client) *AuthManager {
 	am := &AuthManager{
-		apiKeys:     make(map[string]*ClientConfig),
-		rateLimiter: NewRedisRateLimiter(redisClient, "ratelimit"),
+		apiKeys:       make(map[string]*ClientConfig),
+		rateLimiter:   NewRedisRateLimiter(redisClient, "ratelimit"),
+		oauth2Enabled: false,
 		tiers: map[string]RateLimitTier{
 			"free": {
 				RequestsPerMinute: 10,
@@ -151,7 +228,47 @@ func NewAuthManager(redisClient *redis.Client) *AuthManager {
 		Tier: "enterprise",
 	})
 
+	// Initialize OAuth2 validator
+	am.initOAuth2()
+
 	return am
+}
+
+// initOAuth2 initializes the OAuth2 validator using environment configuration.
+func (am *AuthManager) initOAuth2() {
+	keycloakURL := os.Getenv("KEYCLOAK_URL")
+	if keycloakURL == "" {
+		keycloakURL = "http://localhost:8180"
+	}
+	keycloakRealm := os.Getenv("KEYCLOAK_REALM")
+	if keycloakRealm == "" {
+		keycloakRealm = "mcp-demo"
+	}
+	clientID := os.Getenv("OAUTH2_CLIENT_ID")
+	if clientID == "" {
+		clientID = "mcp-client"
+	}
+
+	issuerURL := fmt.Sprintf("%s/realms/%s", keycloakURL, keycloakRealm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	validator, err := NewOAuth2Validator(ctx, issuerURL, clientID)
+	if err != nil {
+		log.Printf("Warning: OAuth2 validation unavailable - failed to initialize: %v", err)
+		return
+	}
+
+	am.oauth2Validator = validator
+	am.oauth2Enabled = true
+	log.Printf("OAuth2 validation enabled with issuer: %s", issuerURL)
+}
+
+// SetOAuth2Validator allows setting a custom OAuth2 validator (for testing).
+func (am *AuthManager) SetOAuth2Validator(validator *OAuth2Validator) {
+	am.oauth2Validator = validator
+	am.oauth2Enabled = validator != nil
 }
 
 // AddAPIKey registers an API key with its configuration. Unknown tiers default to "free".
@@ -168,34 +285,49 @@ func (am *AuthManager) AddAPIKey(apiKey string, config *ClientConfig) {
 	am.apiKeys[apiKey] = config
 }
 
-// Authenticate validates an API key and returns its configuration.
-func (am *AuthManager) Authenticate(apiKey string) (*ClientConfig, error) {
+// Authenticate validates credentials (Bearer token or API key) and returns configuration.
+// Returns ClientConfig, rate limit key, and error.
+func (am *AuthManager) Authenticate(ctx context.Context, authHeader string) (*ClientConfig, string, error) {
+	// Check for Bearer token first (OAuth2)
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		if !am.oauth2Enabled || am.oauth2Validator == nil {
+			return nil, "", fmt.Errorf("OAuth2 authentication is not enabled")
+		}
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		return am.oauth2Validator.Validate(ctx, token)
+	}
+
+	// Fall back to API key authentication
+	return am.authenticateAPIKey(authHeader)
+}
+
+// authenticateAPIKey validates an API key and returns its configuration.
+func (am *AuthManager) authenticateAPIKey(apiKey string) (*ClientConfig, string, error) {
 	am.mu.RLock()
 	defer am.mu.RUnlock()
 
 	config, exists := am.apiKeys[apiKey]
 	if !exists {
-		return nil, fmt.Errorf("invalid API key")
+		return nil, "", fmt.Errorf("invalid API key")
 	}
 
-	return config, nil
+	rateLimitKey := fmt.Sprintf("apikey:%s", apiKey)
+	return config, rateLimitKey, nil
 }
 
-// CheckRateLimit verifies if a request is within the rate limit for the given API key.
-func (am *AuthManager) CheckRateLimit(ctx context.Context, apiKey string) error {
-	am.mu.RLock()
-	config, exists := am.apiKeys[apiKey]
-	am.mu.RUnlock()
-
+// CheckRateLimit verifies if a request is within the rate limit for the given client.
+func (am *AuthManager) CheckRateLimit(ctx context.Context, rateLimitKey string, config *ClientConfig) error {
+	tier, exists := am.tiers[config.Tier]
 	if !exists {
-		return fmt.Errorf("API key not found")
+		tier = am.tiers["free"]
 	}
 
-	tier := am.tiers[config.Tier]
+	// Set the rate limit on the config
+	config.RateLimit = tier.RequestsPerMinute
 
 	allowed, err := am.rateLimiter.IsAllowed(
 		ctx,
-		apiKey,
+		rateLimitKey,
 		tier.RequestsPerMinute,
 		tier.WindowSeconds,
 	)
@@ -211,21 +343,16 @@ func (am *AuthManager) CheckRateLimit(ctx context.Context, apiKey string) error 
 	return nil
 }
 
-// GetRateLimitInfo returns the remaining requests and total limit for an API key.
-func (am *AuthManager) GetRateLimitInfo(ctx context.Context, apiKey string) (remaining int64, limit int, err error) {
-	am.mu.RLock()
-	config, exists := am.apiKeys[apiKey]
-	am.mu.RUnlock()
-
+// GetRateLimitInfo returns the remaining requests and total limit for a client.
+func (am *AuthManager) GetRateLimitInfo(ctx context.Context, rateLimitKey string, config *ClientConfig) (remaining int64, limit int, err error) {
+	tier, exists := am.tiers[config.Tier]
 	if !exists {
-		return 0, 0, fmt.Errorf("API key not found")
+		tier = am.tiers["free"]
 	}
-
-	tier := am.tiers[config.Tier]
 
 	remaining, err = am.rateLimiter.GetRemaining(
 		ctx,
-		apiKey,
+		rateLimitKey,
 		tier.RequestsPerMinute,
 		tier.WindowSeconds,
 	)
@@ -275,68 +402,97 @@ func NewAuthenticatedMCPServer(redisAddr string) (*AuthenticatedMCPServer, error
 func (s *AuthenticatedMCPServer) registerTools() {
 	s.mcpServer.AddTool(&mcp.Tool{
 		Name:        "echo",
-		Description: "Echo back a message (requires authentication)",
+		Description: "Echo back a message (requires authentication via Authorization header or api_key parameter)",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"api_key": map[string]any{
 					"type":        "string",
-					"description": "API key for authentication",
+					"description": "API key for authentication (optional if using Authorization header)",
 				},
 				"message": map[string]any{
 					"type":        "string",
 					"description": "Message to echo",
 				},
 			},
-			"required": []string{"api_key", "message"},
+			"required": []string{"message"},
 		},
 	}, s.handleEchoTool)
 
 	s.mcpServer.AddTool(&mcp.Tool{
 		Name:        "get_time",
-		Description: "Get the current server time (requires authentication)",
+		Description: "Get the current server time (requires authentication via Authorization header or api_key parameter)",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"api_key": map[string]any{
 					"type":        "string",
-					"description": "API key for authentication",
+					"description": "API key for authentication (optional if using Authorization header)",
 				},
 			},
-			"required": []string{"api_key"},
 		},
 	}, s.handleGetTimeTool)
 
 	s.mcpServer.AddTool(&mcp.Tool{
 		Name:        "rate_limit_status",
-		Description: "Check your current rate limit status",
+		Description: "Check your current rate limit status (requires authentication via Authorization header or api_key parameter)",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"api_key": map[string]any{
 					"type":        "string",
-					"description": "API key for authentication",
+					"description": "API key for authentication (optional if using Authorization header)",
 				},
 			},
-			"required": []string{"api_key"},
 		},
 	}, s.handleRateLimitStatusTool)
 }
 
+// getAuthFromContext extracts the auth header or api_key from context and arguments.
+// Returns the auth string (header value or api_key) and whether it's from the header.
+func (s *AuthenticatedMCPServer) getAuthFromContext(ctx context.Context, arguments map[string]any) (string, bool) {
+	// First, check for Authorization header in context
+	if authHeader, ok := ctx.Value(authHeaderKey).(string); ok && authHeader != "" {
+		return authHeader, true
+	}
+
+	// Fall back to api_key parameter
+	if apiKey, ok := arguments["api_key"].(string); ok && apiKey != "" {
+		return apiKey, false
+	}
+
+	return "", false
+}
+
 // authenticateAndCheckRateLimit performs authentication and rate limit checks.
-func (s *AuthenticatedMCPServer) authenticateAndCheckRateLimit(ctx context.Context, apiKey string) (*ClientConfig, error) {
-	clientConfig, err := s.authManager.Authenticate(apiKey)
+// Returns ClientConfig, rate limit key, and error.
+func (s *AuthenticatedMCPServer) authenticateAndCheckRateLimit(ctx context.Context, arguments map[string]any) (*ClientConfig, string, error) {
+	auth, isHeader := s.getAuthFromContext(ctx, arguments)
+	if auth == "" {
+		return nil, "", fmt.Errorf("authentication required: provide Authorization header or api_key parameter")
+	}
+
+	var clientConfig *ClientConfig
+	var rateLimitKey string
+	var err error
+
+	if isHeader {
+		clientConfig, rateLimitKey, err = s.authManager.Authenticate(ctx, auth)
+	} else {
+		clientConfig, rateLimitKey, err = s.authManager.authenticateAPIKey(auth)
+	}
+
 	if err != nil {
 		log.Printf("Authentication failed: %v", err)
-		return nil, fmt.Errorf("authentication failed: %w", err)
+		return nil, "", fmt.Errorf("authentication failed: %w", err)
 	}
 
-	if err := s.authManager.CheckRateLimit(ctx, apiKey); err != nil {
+	if err := s.authManager.CheckRateLimit(ctx, rateLimitKey, clientConfig); err != nil {
 		log.Printf("Rate limit exceeded for %s: %v", clientConfig.Name, err)
-		return nil, err
+		return nil, "", err
 	}
 
-	return clientConfig, nil
+	return clientConfig, rateLimitKey, nil
 }
 
 func (s *AuthenticatedMCPServer) handleEchoTool(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -348,15 +504,7 @@ func (s *AuthenticatedMCPServer) handleEchoTool(ctx context.Context, req *mcp.Ca
 		}, nil
 	}
 
-	apiKey, ok := arguments["api_key"].(string)
-	if !ok {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "API key is required"}},
-			IsError: true,
-		}, nil
-	}
-
-	clientConfig, err := s.authenticateAndCheckRateLimit(ctx, apiKey)
+	clientConfig, rateLimitKey, err := s.authenticateAndCheckRateLimit(ctx, arguments)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Error: %v", err)}},
@@ -372,7 +520,7 @@ func (s *AuthenticatedMCPServer) handleEchoTool(ctx context.Context, req *mcp.Ca
 		}, nil
 	}
 
-	remaining, limit, _ := s.authManager.GetRateLimitInfo(ctx, apiKey)
+	remaining, limit, _ := s.authManager.GetRateLimitInfo(ctx, rateLimitKey, clientConfig)
 
 	responseText := fmt.Sprintf(
 		"Echo from %s: %s\n\nRate Limit: %d/%d remaining",
@@ -396,15 +544,7 @@ func (s *AuthenticatedMCPServer) handleGetTimeTool(ctx context.Context, req *mcp
 		}, nil
 	}
 
-	apiKey, ok := arguments["api_key"].(string)
-	if !ok {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "API key is required"}},
-			IsError: true,
-		}, nil
-	}
-
-	clientConfig, err := s.authenticateAndCheckRateLimit(ctx, apiKey)
+	clientConfig, rateLimitKey, err := s.authenticateAndCheckRateLimit(ctx, arguments)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Error: %v", err)}},
@@ -412,7 +552,7 @@ func (s *AuthenticatedMCPServer) handleGetTimeTool(ctx context.Context, req *mcp
 		}, nil
 	}
 
-	remaining, limit, _ := s.authManager.GetRateLimitInfo(ctx, apiKey)
+	remaining, limit, _ := s.authManager.GetRateLimitInfo(ctx, rateLimitKey, clientConfig)
 
 	responseText := fmt.Sprintf(
 		"Current time: %s\nClient: %s\nRate Limit: %d/%d remaining",
@@ -437,16 +577,25 @@ func (s *AuthenticatedMCPServer) handleRateLimitStatusTool(ctx context.Context, 
 		}, nil
 	}
 
-	apiKey, ok := arguments["api_key"].(string)
-	if !ok {
+	// Get auth from context or parameters
+	auth, isHeader := s.getAuthFromContext(ctx, arguments)
+	if auth == "" {
 		return &mcp.CallToolResult{
-			Content: []mcp.Content{&mcp.TextContent{Text: "API key is required"}},
+			Content: []mcp.Content{&mcp.TextContent{Text: "Authentication required: provide Authorization header or api_key parameter"}},
 			IsError: true,
 		}, nil
 	}
 
-	// Only authenticate, don't check rate limit for status queries
-	clientConfig, err := s.authManager.Authenticate(apiKey)
+	var clientConfig *ClientConfig
+	var rateLimitKey string
+	var err error
+
+	if isHeader {
+		clientConfig, rateLimitKey, err = s.authManager.Authenticate(ctx, auth)
+	} else {
+		clientConfig, rateLimitKey, err = s.authManager.authenticateAPIKey(auth)
+	}
+
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Error: %v", err)}},
@@ -454,7 +603,14 @@ func (s *AuthenticatedMCPServer) handleRateLimitStatusTool(ctx context.Context, 
 		}, nil
 	}
 
-	remaining, limit, err := s.authManager.GetRateLimitInfo(ctx, apiKey)
+	// Set rate limit on config based on tier
+	tier, exists := s.authManager.tiers[clientConfig.Tier]
+	if !exists {
+		tier = s.authManager.tiers["free"]
+	}
+	clientConfig.RateLimit = tier.RequestsPerMinute
+
+	remaining, limit, err := s.authManager.GetRateLimitInfo(ctx, rateLimitKey, clientConfig)
 	if err != nil {
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Error: %v", err)}},
@@ -482,9 +638,21 @@ func (s *AuthenticatedMCPServer) Close() error {
 	return s.redisClient.Close()
 }
 
+// authMiddleware wraps an HTTP handler to inject the Authorization header into context.
+func (s *AuthenticatedMCPServer) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != "" {
+			ctx := context.WithValue(r.Context(), authHeaderKey, authHeader)
+			r = r.WithContext(ctx)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Handler returns an HTTP handler for streamable MCP sessions.
 func (s *AuthenticatedMCPServer) Handler() http.Handler {
-	return mcp.NewStreamableHTTPHandler(
+	mcpHandler := mcp.NewStreamableHTTPHandler(
 		func(req *http.Request) *mcp.Server {
 			// Return the same server instance for all requests
 			// The MCP server handles multiple concurrent sessions
@@ -494,6 +662,7 @@ func (s *AuthenticatedMCPServer) Handler() http.Handler {
 			SessionTimeout: 30 * time.Minute,
 		},
 	)
+	return s.authMiddleware(mcpHandler)
 }
 
 // Run starts the HTTP server on the given address.
@@ -501,8 +670,14 @@ func (s *AuthenticatedMCPServer) Run(addr string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", s.Handler())
 
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
 	log.Printf("MCP server listening on http://%s/mcp", addr)
-	return http.ListenAndServe(addr, mux)
+	return server.ListenAndServe()
 }
 
 func main() {
@@ -516,10 +691,17 @@ func main() {
 	defer server.Close()
 
 	log.Printf("Starting authenticated MCP server with Redis at %s", redisAddr)
-	log.Println("Available API keys:")
-	log.Println("  - Free tier: key_free_abc123 (10 req/min)")
-	log.Println("  - Pro tier: key_pro_xyz789 (100 req/min)")
-	log.Println("  - Enterprise: key_ent_def456 (1000 req/min)")
+	log.Println("Authentication methods:")
+	log.Println("  1. API Key (via api_key parameter):")
+	log.Println("     - Free tier: key_free_abc123 (10 req/min)")
+	log.Println("     - Pro tier: key_pro_xyz789 (100 req/min)")
+	log.Println("     - Enterprise: key_ent_def456 (1000 req/min)")
+	if server.authManager.oauth2Enabled {
+		log.Println("  2. OAuth2 (via Authorization: Bearer <token> header)")
+		log.Println("     Token tier claim determines rate limit")
+	} else {
+		log.Println("  2. OAuth2: unavailable (Keycloak not reachable)")
+	}
 
 	if err := server.Run(httpAddr); err != nil {
 		log.Fatalf("Server error: %v", err)

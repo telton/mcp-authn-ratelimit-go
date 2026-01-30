@@ -4,8 +4,20 @@ services:
     restart: always
     ports:
       - '6379:6379'
-    volumes: 
+    volumes:
       - redis:/data
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: 8180
+    ports:
+      - "8180:8180"
+    depends_on:
+      - redis
 
 volumes:
   redis:
