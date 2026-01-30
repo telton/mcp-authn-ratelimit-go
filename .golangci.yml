@@ -1,0 +1,79 @@
+version: "2"
+issues:
+  # Maximum count of issues with the same text.
+  # Set to 0 to disable.
+  # Default: 3
+  max-same-issues: 0
+
+linters:
+  default: none
+  enable:
+    - gosec
+    - errcheck
+    - errorlint
+    - govet
+    - ineffassign
+    - revive
+    - sloglint
+    - staticcheck
+    - testifylint
+    - unconvert
+    - unused
+    - usetesting
+    - whitespace
+    - modernize
+
+  settings:
+    usetesting:
+      os-create-temp: true
+      os-mkdir-temp: true
+      os-setenv: true
+      os-temp-dir: true
+      os-chdir: true
+      context-background: true
+      context-todo: true
+    errorlint:
+      asserts: false
+      comparison: false
+    testifylint:
+      disable:
+        - require-error
+    revive:
+      rules:
+        - name: indent-error-flow
+    sloglint:
+      no-global: "default"
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      # Simplify code: gofmt with `-s` option.
+      simplify: true
+      # Apply the rewrite rules to the source before reformatting.
+      rewrite-rules:
+        - pattern: "interface{}"
+          replacement: "any"
+    goimports:
+      local-prefixes:
+        - github.com/telton
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
