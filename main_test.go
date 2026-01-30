@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -15,25 +16,70 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 	"pgregory.net/rapid"
 )
 
 // Test helpers
 
+// Shared Redis container for all tests - started once per test run
+var (
+	sharedRedisContainer *tcredis.RedisContainer
+	sharedRedisAddr      string
+	redisContainerOnce   sync.Once
+	redisContainerErr    error
+)
+
+// getSharedRedisContainer returns a shared Redis container for all tests.
+// The container is started once and reused across all tests for performance.
+func getSharedRedisContainer(t *testing.T) string {
+	t.Helper()
+
+	redisContainerOnce.Do(func() {
+		ctx := t.Context()
+		container, err := tcredis.Run(ctx, "redis:7-alpine")
+		if err != nil {
+			redisContainerErr = fmt.Errorf("failed to start redis container: %w", err)
+			return
+		}
+
+		endpoint, err := container.Endpoint(ctx, "")
+		if err != nil {
+			redisContainerErr = fmt.Errorf("failed to get redis endpoint: %w", err)
+			return
+		}
+
+		sharedRedisContainer = container
+		sharedRedisAddr = endpoint
+	})
+
+	if redisContainerErr != nil {
+		t.Fatalf("Redis container setup failed: %v", redisContainerErr)
+	}
+
+	return sharedRedisAddr
+}
+
 func setupTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
+
+	addr := getSharedRedisContainer(t)
+
 	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: addr,
 		DB:   15, // Use DB 15 for tests to avoid conflicts
 	})
 
 	ctx := t.Context()
 	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skipf("Redis not available: %v", err)
+		t.Fatalf("Redis ping failed: %v", err)
 	}
 
 	// Clean up test DB
-	client.FlushDB(ctx)
+	if err := client.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("Failed to flush test DB: %v", err)
+	}
 
 	t.Cleanup(func() {
 		client.FlushDB(ctx)
@@ -41,6 +87,20 @@ func setupTestRedis(t *testing.T) *redis.Client {
 	})
 
 	return client
+}
+
+// TestMain handles shared container cleanup
+func TestMain(m *testing.M) {
+	code := m.Run()
+
+	// Clean up the shared container after all tests
+	if sharedRedisContainer != nil {
+		ctx := context.Background()
+		_ = testcontainers.TerminateContainer(sharedRedisContainer)
+		_ = ctx // suppress unused warning
+	}
+
+	os.Exit(code)
 }
 
 func setupTestAuthManager(t *testing.T) (*AuthManager, *redis.Client) {
@@ -751,16 +811,16 @@ func TestRateLimiter_Property_RemainingPlusUsedEqualsMax(t *testing.T) {
 }
 
 func TestAuthManager_Property_ValidKeysAlwaysAuthenticate(t *testing.T) {
-	// Skip if Redis not available
+	addr := getSharedRedisContainer(t)
 	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: addr,
 		DB:   15,
 	})
 	defer client.Close()
 
 	ctx := t.Context()
 	if err := client.Ping(ctx).Err(); err != nil {
-		t.Skipf("Redis not available: %v", err)
+		t.Fatalf("Redis ping failed: %v", err)
 	}
 
 	rapid.Check(t, func(rt *rapid.T) {
@@ -993,8 +1053,14 @@ func TestRateLimitEnforcement_FreeTier(t *testing.T) {
 // =============================================================================
 
 func BenchmarkRateLimiter_IsAllowed(b *testing.B) {
+	// Note: For benchmarks, we need the container running
+	// Use the shared address if available, otherwise skip
+	if sharedRedisAddr == "" {
+		b.Skip("Redis container not available - run tests first to start container")
+	}
+
 	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: sharedRedisAddr,
 		DB:   15,
 	})
 	defer client.Close()
@@ -1014,8 +1080,12 @@ func BenchmarkRateLimiter_IsAllowed(b *testing.B) {
 }
 
 func BenchmarkAuthManager_Authenticate(b *testing.B) {
+	if sharedRedisAddr == "" {
+		b.Skip("Redis container not available - run tests first to start container")
+	}
+
 	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: sharedRedisAddr,
 		DB:   15,
 	})
 	defer client.Close()
@@ -1047,8 +1117,12 @@ func BenchmarkAuthManager_Authenticate(b *testing.B) {
 }
 
 func BenchmarkRateLimiter_Concurrent(b *testing.B) {
+	if sharedRedisAddr == "" {
+		b.Skip("Redis container not available - run tests first to start container")
+	}
+
 	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: sharedRedisAddr,
 		DB:   15,
 	})
 	defer client.Close()
